@@ -10,6 +10,57 @@ app.use(cors());
 
 const PORT = process.env.PORT || 5000;
 
+// Función para calcular probabilidad de lluvia basada en precipitación y humedad
+function calculateRainProbability(precipitation, humidity, hours) {
+  const rainHours = precipitation.filter(p => p > 0.1).length;
+  const baseProbability = (rainHours / hours) * 100;
+  
+  // Ajustar por humedad si está disponible
+  let humidityBonus = 0;
+  if (humidity && humidity.length > 0) {
+    const avgHumidity = humidity.reduce((a, b) => a + b, 0) / humidity.length;
+    humidityBonus = avgHumidity > 80 ? 10 : (avgHumidity > 60 ? 5 : 0);
+  }
+  
+  return Math.min(100, Math.round(baseProbability + humidityBonus));
+}
+
+// Función para evaluar temperatura
+function evaluateTemperature(temperatures) {
+  const avgTemp = temperatures.reduce((a, b) => a + b, 0) / temperatures.length;
+  const maxTemp = Math.max(...temperatures);
+  const minTemp = Math.min(...temperatures);
+  
+  let tempStatus = 'normal';
+  if (maxTemp > 35) tempStatus = 'muy_alta';
+  else if (minTemp < 0) tempStatus = 'muy_baja';
+  else if (maxTemp > 30) tempStatus = 'alta';
+  else if (minTemp < 5) tempStatus = 'baja';
+  
+  return {
+    average: Math.round(avgTemp * 10) / 10,
+    max: Math.round(maxTemp * 10) / 10,
+    min: Math.round(minTemp * 10) / 10,
+    status: tempStatus
+  };
+}
+
+// Función para evaluar viento
+function evaluateWind(windSpeeds) {
+  const avgWind = windSpeeds.reduce((a, b) => a + b, 0) / windSpeeds.length;
+  const maxWind = Math.max(...windSpeeds);
+  
+  let windStatus = 'Poco';
+  if (maxWind > 20) windStatus = 'Mucho';
+  else if (avgWind > 10) windStatus = 'Común';
+  
+  return {
+    average: Math.round(avgWind * 10) / 10,
+    max: Math.round(maxWind * 10) / 10,
+    status: windStatus
+  };
+}
+
 app.get('/', (req, res) => {
   res.send('¡Hola! El servidor Express funciona.');
 });
@@ -63,7 +114,7 @@ app.get('/api/willitrain', async (req, res) => {
     let params = new URLSearchParams({
       latitude: lat,
       longitude: lon,
-      hourly: 'precipitation',
+      hourly: 'precipitation,temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m',
       timezone: 'auto',
     });
 
@@ -89,12 +140,16 @@ app.get('/api/willitrain', async (req, res) => {
     if (!resp.ok) return res.status(resp.status).json({ error: 'weather provider error' });
     const data = await resp.json();
 
-    if (!data.hourly || !data.hourly.time || !data.hourly.precipitation) {
+    if (!data.hourly || !data.hourly.time || !data.hourly.precipitation || !data.hourly.temperature_2m || !data.hourly.wind_speed_10m) {
       return res.status(502).json({ error: 'unexpected weather data format' });
     }
 
     const times = data.hourly.time.map(t => new Date(t));
     const precs = data.hourly.precipitation.map(Number);
+    const temps = data.hourly.temperature_2m.map(Number);
+    const humidity = data.hourly.relative_humidity_2m ? data.hourly.relative_humidity_2m.map(Number) : null;
+    const windSpeed = data.hourly.wind_speed_10m.map(Number);
+    const windDirection = data.hourly.wind_direction_10m ? data.hourly.wind_direction_10m.map(Number) : null;
 
     if (targetDate) {
       // buscar el índice con la hora más cercana al targetDate
@@ -110,19 +165,43 @@ app.get('/api/willitrain', async (req, res) => {
       }
 
       const precip = precs[idx] ?? 0;
+      const temp = temps[idx] ?? 0;
       const willRain = precip >= threshNum;
-      // devolver el punto objetivo y contexto (unas horas anteriores y posteriores)
+      
+      // Calcular probabilidad de lluvia para el período
       const window = 6; // horas de contexto
       const start = Math.max(0, idx - window);
       const end = Math.min(times.length, idx + window + 1);
+      const contextPrecs = precs.slice(start, end);
+      const contextTemps = temps.slice(start, end);
+      const contextHumidity = humidity ? humidity.slice(start, end) : null;
+      const contextWindSpeed = windSpeed.slice(start, end);
+      
+      const rainProbability = calculateRainProbability(contextPrecs, contextHumidity, end - start);
+      const temperatureData = evaluateTemperature(contextTemps);
+      const windData = evaluateWind(contextWindSpeed);
+      
       const points = [];
-      for (let i = start; i < end; i++) points.push({ time: times[i].toISOString(), precipitation: precs[i] });
+      for (let i = start; i < end; i++) {
+        points.push({ 
+          time: times[i].toISOString(), 
+          precipitation: precs[i],
+          temperature: temps[i],
+          humidity: humidity ? humidity[i] : null,
+          windSpeed: windSpeed[i],
+          windDirection: windDirection ? windDirection[i] : null
+        });
+      }
 
       return res.json({
         mode: 'specific_date',
         requestedDate: targetDate.toISOString(),
         willRain,
+        rainProbability,
         precipitationMm: precip,
+        temperature: temp,
+        temperatureData,
+        windData,
         thresholdMm: threshNum,
         contextHours: points,
       });
@@ -134,14 +213,34 @@ app.get('/api/willitrain', async (req, res) => {
     if (startIdx === -1) startIdx = times.length - 1;
     const sliceTimes = times.slice(startIdx, startIdx + hoursNum);
     const slicePrecs = precs.slice(startIdx, startIdx + hoursNum);
-    const points = sliceTimes.map((t, i) => ({ time: t.toISOString(), precipitation: slicePrecs[i] }));
+    const sliceTemps = temps.slice(startIdx, startIdx + hoursNum);
+    const sliceHumidity = humidity ? humidity.slice(startIdx, startIdx + hoursNum) : null;
+    const sliceWindSpeed = windSpeed.slice(startIdx, startIdx + hoursNum);
+    
+    const points = sliceTimes.map((t, i) => ({ 
+      time: t.toISOString(), 
+      precipitation: slicePrecs[i],
+      temperature: sliceTemps[i],
+      humidity: sliceHumidity ? sliceHumidity[i] : null,
+      windSpeed: sliceWindSpeed[i],
+      windDirection: windDirection ? windDirection[startIdx + i] : null
+    }));
+    
     const maxPrecip = points.reduce((m, p) => (p.precipitation > m ? p.precipitation : m), 0);
     const willRain = points.some(p => p.precipitation >= threshNum);
+    
+    // Calcular probabilidad de lluvia y datos de temperatura
+    const rainProbability = calculateRainProbability(slicePrecs, sliceHumidity, hoursNum);
+    const temperatureData = evaluateTemperature(sliceTemps);
+    const windData = evaluateWind(sliceWindSpeed);
 
     return res.json({
       mode: 'next_hours',
       willRain,
+      rainProbability,
       maxPrecipitationMm: maxPrecip,
+      temperatureData,
+      windData,
       hoursAnalyzed: points.length,
       thresholdMm: threshNum,
       points,
